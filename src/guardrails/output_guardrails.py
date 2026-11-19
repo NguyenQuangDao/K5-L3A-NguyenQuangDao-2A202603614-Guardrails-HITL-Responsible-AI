@@ -6,6 +6,7 @@ Checkpoint 2 — Output Guardrails
 """
 import re
 import textwrap
+import unicodedata
 
 from google.genai import types
 from google.adk.agents import llm_agent
@@ -13,6 +14,41 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+
+
+_INVISIBLE_TABLE = str.maketrans(
+    "", "", "\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062\u2063\u2064\ufeff\u00ad\u180e"
+)
+
+# Regex đã compile — thứ tự dict = thứ tự áp dụng (secret trước, PII số sau)
+PII_PATTERNS: dict[str, re.Pattern] = {
+    # Secret lab / khoá: sk-..., admin123, host nội bộ *.internal[:port]
+    "api_key": re.compile(r"\bsk-[A-Za-z0-9_-]{4,}"),
+    "password": re.compile(
+        r"\b(?:password|passwd|pwd|mật\s*khẩu|mat\s*khau)\b"
+        r"\s*(?:is|was|=|:|là|la)\s*[\"'`]?[^\s\"'`,;]+",
+        re.IGNORECASE,
+    ),
+    "secret_value": re.compile(r"\badmin123\b", re.IGNORECASE),
+    "internal_host": re.compile(
+        r"\b[\w.-]+\.internal(?::\d{2,5})?\b", re.IGNORECASE
+    ),
+    # PII
+    "email": re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}\b"),
+    "national_id": re.compile(r"(?<!\d)(?:\d{12}|\d{9})(?!\d)"),  # CCCD 12 số / CMND 9 số
+    "phone": re.compile(r"(?<!\d)(?:\+?84|0)(?:[\s.-]?\d){9,10}(?!\d)"),  # SĐT VN 10–11 số
+}
+
+# Chữ ký secret sau khi bỏ hết ký tự không phải chữ/số
+_PROTECTED_SIGNATURES = ("admin123", "skvinbanksecret2024", "dbvinbankinternal")
+# Loại issue = secret hệ thống → chặn cả câu; còn lại (PII) → chỉ redact
+SECRET_ISSUE_TYPES = frozenset(
+    {"api_key", "password", "secret_value", "internal_host", "obfuscated_secret"}
+)
+SECRET_WITHHELD_MESSAGE = (
+    "I cannot share internal system details. "
+    "I can help with VinBank accounts, transfers, savings, loans and cards."
+)
 
 
 # ============================================================
@@ -37,23 +73,23 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
+    # Chuẩn hoá + bỏ ký tự vô hình để không bị lách bằng ``admin\u200b123``
+    scan = unicodedata.normalize("NFKC", redacted).translate(_INVISIBLE_TABLE)
+    redacted = scan
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
+    # Thứ tự quan trọng: secret/khoá trước, rồi PII số (12 số trước 9 số, SĐT…)
     for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+        matches = pattern.findall(redacted)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            redacted = pattern.sub("[REDACTED]", redacted)
+
+    # Lớp cuối: secret lab bị chèn ký tự (``a.d.m.i.n.1.2.3``) — nếu còn sót thì che cả câu trả lời
+    collapsed = re.sub(r"[^a-z0-9]", "", redacted.lower())
+    if any(sig in collapsed for sig in _PROTECTED_SIGNATURES):
+        issues.append("obfuscated_secret: 1 found")
+        redacted = SECRET_WITHHELD_MESSAGE
 
     return {
         "safe": len(issues) == 0,
@@ -149,6 +185,8 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_issues: list[str] = []
+        self.last_action: str = "pass"  # pass | redacted | blocked
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -169,19 +207,45 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
 
         response_text = self._extract_text(llm_response)
+        self.last_action = "pass"
+        self.last_issues = []
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Regex filter
+        result = content_filter(response_text)
+        if not result["safe"]:
+            self.last_issues = result["issues"]
+            issue_types = {i.split(":")[0] for i in result["issues"]}
+            if issue_types & SECRET_ISSUE_TYPES:
+                # Model định lộ secret hệ thống → chặn cả câu trả lời (không trả bản vá víu)
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                final_text = SECRET_WITHHELD_MESSAGE
+            else:
+                # Chỉ có PII (SĐT/email/CCCD) → che từng phần, vẫn trả lời khách
+                self.redacted_count += 1
+                self.last_action = "redacted"
+                final_text = result["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=final_text)],
+            )
+            response_text = final_text
 
-        return llm_response  # TODO: modify if needed
+        # 2. (Optional) LLM-as-Judge trên bản đã lọc
+        if self.use_llm_judge and self.last_action != "blocked":
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                self.last_action = "blocked"
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=SECRET_WITHHELD_MESSAGE)],
+                )
+
+        # 3. Trả response (có thể đã sửa)
+        return llm_response
 
 
 # ============================================================
